@@ -364,7 +364,9 @@ svg[data-mood="happy"] .eyes{display:none}
         <button class="mini" id="tabScene" type="button">장면별</button>
         <button class="mini" id="admRefresh" type="button">새로고침</button>
         <button class="mini" id="admCopy" type="button">표 복사</button>
+        <button class="mini" id="admTest" type="button">연결 점검</button>
         <button class="mini" id="admBackup" type="button">백업 받기</button>
+        <button class="mini" id="admCheck" type="button">연결 점검</button>
         <button class="mini" id="admExit" type="button">나가기</button>
       </div>
       <p class="badge" data-badge></p>
@@ -1097,7 +1099,7 @@ async function renderGate(){
   $('#confirm').hidden = true;
   const nums = parseRoster(cfg.roster);
   let claims = {};
-  if (DB.cloud && cfg.lock){ try{ claims = (await DB.get('claims', 6000)) || {}; }catch(e){} }
+  if (DB.cloud && cfg.lock){ try{ claims = (await DB.get('claims', 6000)) || {}; }catch(e){ DB.lastErr = e; if (errKind(e) === 'permission') $('#gateMsg').textContent = '저장소 권한 설정이 필요해요. 선생님께 말씀드려 주세요.'; } }
   nums.forEach(n => {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'num'; b.textContent = n;
@@ -1108,6 +1110,11 @@ async function renderGate(){
   });
   if (!nums.length) $('#gateMsg').textContent = '입장할 번호가 아직 없어요. 선생님께 말씀드려 주세요.';
 }
+function connMsg(){
+  if (typeof firebase === 'undefined') return 'Firebase 파일을 불러오지 못했어요. 학교 인터넷에서 막혔을 수 있어요. 선생님께 알려 주세요.';
+  if (!DB.fb) return '연결 설정에 문제가 있어요. 선생님께 알려 주세요.';
+  return 'Firebase에 연결하지 못했어요. 인터넷을 확인하고 새로고침해 주세요.';
+}
 let picked = null;
 function pickNumber(n, taken){
   const msg = $('#gateMsg');
@@ -1117,16 +1124,50 @@ function pickNumber(n, taken){
   $('#confirmQ').textContent = n + '번이 맞나요? 다른 친구의 번호를 누르면 안 돼요.';
   $('#confirm').hidden = false;
 }
+function errKind(e){
+  const c = String((e && (e.code || e.message)) || e || '').toLowerCase();
+  if (c.indexOf('permission') >= 0) return 'permission';
+  if (c.indexOf('timeout') >= 0) return 'timeout';
+  return 'other';
+}
+function errMsg(e){ return String((e && (e.code || e.message)) || e || '').slice(0, 90); }
+function enterFail(e){
+  DB.lastErr = e;
+  try{ console.warn('입장 실패', e); }catch(x){}
+  const k = errKind(e);
+  if (k === 'permission') return '기록을 저장할 권한이 없어요. 선생님께 말씀드려 주세요. (저장소 권한 문제 · 선생님 화면의 ‘연결 점검’을 눌러 보세요)';
+  if (k === 'timeout') return '연결이 느려요. 잠시 뒤 다시 눌러 주세요.';
+  return '입장하지 못했어요. 선생님께 말씀드려 주세요. (' + errMsg(e) + ')';
+}
+async function claimNumber(n){
+  const r = DB.ref('claims/' + n);
+  const cur = (await withTimeout(r.once('value'), 8000)).val();
+  if (cur && cur.dev !== deviceId) return false;
+  if (!cur){
+    await withTimeout(r.set({ dev: deviceId, at: Date.now() }), 8000);
+    const again = (await withTimeout(r.once('value'), 8000)).val();
+    return !!again && again.dev === deviceId;
+  }
+  return true;
+}
 async function enter(n){
   const msg = $('#gateMsg');
   $('#confirm').hidden = true;
   if (!DB.cloud){ msg.textContent = '인터넷 연결을 확인해 주세요. 연결되어야 입장할 수 있어요.'; return; }
   if (cfg.lock){
+    let ok = null;
     try{
       const r = await withTimeout(DB.ref('claims/' + n).transaction(c => c === null ? { dev: deviceId, at: Date.now() } : (c.dev === deviceId ? c : undefined)), 8000);
-      if (!r.committed){ msg.textContent = n + '번은 이미 다른 기기에서 입장했어요. 선생님께 말씀드려 주세요.'; renderGate(); return; }
-    }catch(e){ msg.textContent = '입장하지 못했어요. 잠시 뒤 다시 눌러 주세요.'; return; }
+      ok = r.committed;
+    }catch(e){
+      if (errKind(e) === 'permission'){ msg.textContent = enterFail(e); return; }
+      try{ ok = await claimNumber(n); }catch(e2){ msg.textContent = enterFail(e2); return; }
+    }
+    if (!ok){ msg.textContent = n + '번은 이미 다른 기기에서 입장했어요. 선생님께 말씀드려 주세요.'; renderGate(); return; }
   }
+  /* 기록을 저장할 수 있는지 입장할 때 미리 확인 (저장이 안 되면 입장시키지 않아요) */
+  try{ await withTimeout(DB.ref('students/' + n).update({ dev: deviceId, updatedAt: Date.now() }), 8000); }
+  catch(e){ msg.textContent = enterFail(e); return; }
   me.n = n;
   try{ localStorage.setItem(LS_MY, String(n)); }catch(e){}
   await loadRecord();
@@ -1200,7 +1241,7 @@ function startAdminListeners(){
   bind('config', v => { if (v){ if (v.roster) cfg.roster = String(v.roster); if (typeof v.lock === 'boolean') cfg.lock = v.lock; } });
 }
 function setTabs(){
-  $('#tabStu').classList.toggle('on', adm.view !== 'scene');
+  $('#tabStu').classList.toggle('on', adm.view !== 'scene' && adm.view !== 'check');
   $('#tabScene').classList.toggle('on', adm.view === 'scene');
 }
 function rosterNums(){
@@ -1212,6 +1253,7 @@ function rosterNums(){
 function fmtTime(t){ if (!t) return '-'; const d = new Date(t); return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
 function renderAdmin(){
   const b = $('#admBody');
+  if (adm.view === 'check'){ b.innerHTML = checkHtml(); return; }
   if (!DB.cloud){ b.innerHTML = '<p>⚠️ 인터넷(Firebase)에 연결되지 않아서 기록을 볼 수 없어요. 연결을 확인하고 ‘새로고침’을 눌러 주세요.</p>'; return; }
   if (adm.view === 'table'){
     b.innerHTML = '<div class="adm-set"><label>학생 번호 <input type="text" id="rosterInput" aria-label="학생 번호 범위"></label>' +
@@ -1292,6 +1334,64 @@ function sceneHtml(){
     '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>번호</th><th>최종 말풍선</th><th>시도</th><th>결과</th><th>점수</th></tr></thead><tbody>' +
     (rows || '<tr><td colspan="5">아직 답한 학생이 없어요.</td></tr>') + '</tbody></table></div>';
 }
+async function testConn(){
+  const out = [];
+  out.push('Firebase 파일: ' + (typeof firebase !== 'undefined' ? '불러옴' : '못 불러옴 (인터넷·학교 차단 확인)'));
+  out.push('실시간 연결: ' + (DB.connected ? '됨' : '안 됨'));
+  if (DB.fb){
+    const er = e => (e && (e.code || e.message)) || '알 수 없음';
+    try{ await withTimeout(DB.ref('_ping').set({ t: Date.now() }), 7000); out.push('쓰기: 성공'); }catch(e){ out.push('쓰기: 실패 (' + er(e) + ')'); }
+    try{ const v = await DB.get('_ping', 7000); out.push('읽기: ' + (v ? '성공' : '비어 있음')); }catch(e){ out.push('읽기: 실패 (' + er(e) + ')'); }
+    try{ await withTimeout(DB.ref('claims/_t').transaction(() => ({ t: 1 })), 7000); await DB.ref('claims/_t').remove(); out.push('입장 잠금: 성공'); }catch(e){ out.push('입장 잠금: 실패 (' + er(e) + ')'); }
+    try{ await DB.ref('_ping').remove(); }catch(e){}
+    if (out.some(x => /permission/i.test(x))) out.push('→ Firebase 규칙이 ' + APP.ROOT + ' 폴더 쓰기를 막고 있어요. 규칙에 이 폴더를 허용해 주세요.');
+  }
+  alert(out.join('\n'));
+}
+
+/* ----- 연결 점검 ----- */
+async function runCheck(){
+  adm.view = 'check'; setTabs();
+  adm.check = null;
+  $('#admBody').innerHTML = '<p>점검 중… (최대 40초)</p>';
+  const out = [];
+  const step = async (name, fn) => {
+    try{ await withTimeout(fn(), 8000); out.push({ ok: true, name: name, note: '' }); return true; }
+    catch(e){ out.push({ ok: false, name: name, note: errMsg(e), kind: errKind(e) }); return false; }
+  };
+  out.push({ ok: !!DB.fb, name: 'Firebase 불러오기', note: DB.fb ? '' : '인터넷이나 Firebase 스크립트를 불러오지 못했어요' });
+  out.push({ ok: !!DB.connected, name: '서버 연결', note: DB.connected ? '' : '연결되지 않았어요' });
+  if (DB.fb && DB.connected){
+    await step('읽기 (' + APP.ROOT + '/config)', () => DB.ref('config').once('value'));
+    await step('쓰기 (' + APP.ROOT + '/_check)', () => DB.ref('_check/ping').set(Date.now()));
+    await step('쓴 값 다시 읽기', () => DB.ref('_check/ping').once('value').then(sn => { if (sn.val() == null) throw new Error('값이 비어 있어요'); }));
+    await step('번호 입장 잠금(트랜잭션)', () => DB.ref('_check/tx').transaction(c => c === null ? { t: Date.now() } : c).then(r => { if (!r.committed) throw new Error('commit 안 됨'); }));
+    await step('점검 기록 지우기', () => DB.ref('_check').remove());
+  }
+  adm.check = out;
+  renderAdmin();
+}
+function checkHtml(){
+  const out = adm.check || [];
+  const rows = out.map(x => '<li>' + (x.ok ? '✓' : '✕') + ' ' + esc(x.name) + (x.ok ? '' : ' — <span class="stag bad">' + esc(x.note || '실패') + '</span>') + '</li>').join('');
+  const perm = out.some(x => !x.ok && x.kind === 'permission');
+  const anyFail = out.some(x => !x.ok);
+  let help = '';
+  if (perm){
+    help = '<p><b>원인: Firebase 규칙이 <code>' + esc(APP.ROOT) + '</code> 폴더를 막고 있어요.</b></p>' +
+      '<ol><li>Firebase 콘솔 → <b>Realtime Database</b> → <b>규칙</b> 탭을 열어요.</li>' +
+      '<li>기존 규칙은 그대로 두고, <code>"rules": { … }</code> 안에 아래를 <b>한 줄 더 추가</b>해요. (다른 앱 폴더 옆에 붙여 넣어요.)</li>' +
+      '<li><b>게시</b>를 누르고, 이 화면에서 ‘연결 점검’을 다시 눌러 봐요.</li></ol>' +
+      '<pre class="rd">"' + esc(APP.ROOT) + '": { ".read": true, ".write": true }</pre>' +
+      '<p class="badge">규칙이 <code>now &lt; 숫자</code> 모양(테스트 모드)이라면 기간이 끝나서 모든 앱이 막힌 거예요. 날짜를 늘리거나 위처럼 폴더별 규칙으로 바꿔 주세요.</p>';
+  } else if (anyFail){
+    help = '<p>연결 문제로 보여요. 인터넷을 확인하고 다시 점검해 보세요. 계속 안 되면 위의 빨간 글자를 알려 주세요.</p>';
+  } else if (out.length){
+    help = '<p><b>✓ 모두 정상이에요.</b> 학생들이 입장해도 돼요. 그래도 입장이 안 되면 학생 화면의 빨간 안내 문구를 알려 주세요.</p>';
+  }
+  return '<p><button class="mini" data-act="back" type="button">← 목록으로</button></p><h3>연결 점검</h3><ul>' + rows + '</ul>' + help;
+}
+
 async function allAnswers(){ try{ return (await DB.get('answers', 10000)) || {}; }catch(e){ return {}; } }
 async function copyTable(){
   const all = await allAnswers(), lines = [['번호', '장면', '친구가 한 말', '1단계 시도', '2단계 시도', '최종 말풍선', '결과', '점수', '2단계 입력 전체'].join('\t')];
@@ -1756,6 +1856,8 @@ $("#tabScene").addEventListener("click", showScene);
 $("#admRefresh").addEventListener("click", async function(){ await DB.init(); startAdminListeners(); if (adm.view === "scene") showScene(); else if (adm.view === "detail") showDetail(adm.sel); else renderAdmin(); });
 $("#admCopy").addEventListener("click", copyTable);
 $("#admBackup").addEventListener("click", backupAll);
+$("#admCheck").addEventListener("click", runCheck);
+$("#admTest").addEventListener("click", testConn);
 $("#admBody").addEventListener("click", function(e){
   var t = e.target.closest("button"); if (!t) return;
   if (t.id === "rosterSave") return saveRoster();
